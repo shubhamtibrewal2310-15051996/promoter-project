@@ -1,7 +1,6 @@
 # pipelines/collect_fii_dii.py
 import datetime as dt
-import json
-import time
+import re
 import pathlib as pl
 import pandas as pd
 import requests
@@ -9,137 +8,144 @@ import requests
 DATA = pl.Path("data")
 DATA.mkdir(exist_ok=True)
 
-NSE_HOME = "https://www.nseindia.com/"
-# Common NSE endpoints used in the wild (they change names occasionally).
-# We'll try a couple, first one that returns valid JSON wins.
-CANDIDATE_URLS = [
-    "https://www.nseindia.com/api/fiidiiTradeReact",  # newer
-    "https://www.nseindia.com/api/fiidiiTrade",       # older
-]
+MC_URL = "https://www.moneycontrol.com/stocks/marketstats/fii_dii_activity/index.php"
+UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36"}
 
-HEADERS = {
-    "user-agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "accept": "application/json, text/plain, */*",
-    "referer": "https://www.nseindia.com/",
-    "pragma": "no-cache",
-    "cache-control": "no-cache",
-}
+def to_date_any(s):
+    if s is None: return None
+    s = str(s).strip()
+    for fmt in ("%d-%b-%Y", "%d-%m-%Y", "%Y-%m-%d", "%d/%m/%Y"):
+        try:
+            return dt.datetime.strptime(s, fmt).date()
+        except Exception:
+            pass
+    # fallback: match like 20-Aug-2025
+    m = re.match(r"(\d{1,2})-([A-Za-z]{3})-(\d{4})", s)
+    if m:
+        try:
+            return dt.datetime.strptime(m.group(0), "%d-%b-%Y").date()
+        except Exception:
+            return None
+    return None
 
-def fetch_fii_dii():
-    """Return a pandas DataFrame with columns: date, segment, fii_net_value_cr, dii_net_value_cr."""
-    with requests.Session() as s:
-        # warm-up to get cookies
-        s.get(NSE_HOME, headers=HEADERS, timeout=15)
-        time.sleep(0.5)
+def to_float(x):
+    try:
+        return float(str(x).replace(",", "").replace("\xa0", " ").strip())
+    except Exception:
+        return None
 
-        last_err = None
-        payload_df = None
-        for url in CANDIDATE_URLS:
+def fetch_from_moneycontrol() -> pd.DataFrame:
+    # get HTML
+    r = requests.get(MC_URL, headers=UA, timeout=30)
+    r.raise_for_status()
+
+    # parse all tables on the page
+    tables = pd.read_html(r.text)  # requires lxml/html5lib installed
+    if not tables:
+        raise RuntimeError("No tables found on Moneycontrol page")
+
+    candidate = None
+    for t in tables:
+        if t.shape[1] < 5:
+            continue
+        # try first two columns for date-like values
+        date_col_idx = None
+        for idx in (0, 1):
             try:
-                r = s.get(url, headers=HEADERS, timeout=20)
-                r.raise_for_status()
-                js = r.json()
-                # The payload is generally in js["data"] or js itself. Normalize defensively.
-                data = js.get("data", js)
-                if isinstance(data, dict) and "data" in data:
-                    data = data["data"]
-                if isinstance(data, list) and data:
-                    # Typical keys: "date", "fii_net", "dii_net", "category", etc.
-                    # Normalize to our schema.
-                    rows = []
-                    for row in data:
-                        # Accept a variety of key spellings
-                        date_str = row.get("date") or row.get("TradeDate") or row.get("TRADE_DATE")
-                        if not date_str:
-                            continue
-                        # Try parse date as DD-MMM-YYYY or YYYY-MM-DD
-                        parsed = None
-                        for fmt in ("%d-%b-%Y", "%Y-%m-%d", "%d-%m-%Y"):
-                            try:
-                                parsed = dt.datetime.strptime(date_str.strip(), fmt).date()
-                                break
-                            except Exception:
-                                pass
-                        if not parsed:
-                            # Last resort: leave as string and skip
-                            continue
-
-                        seg = row.get("category") or row.get("Segment") or "Cash"
-                        # Net values often in crores; accept multiple key patterns
-                        fii_net = (
-                            row.get("FII Net Value", row.get("fii_net", row.get("FII_NET", row.get("fii_net_buy_value"))))
-                        )
-                        dii_net = (
-                            row.get("DII Net Value", row.get("dii_net", row.get("DII_NET", row.get("dii_net_buy_value"))))
-                        )
-
-                        # Some payloads provide separate buy/sell; compute net if both exist.
-                        if fii_net is None and ("fii_buy" in row and "fii_sell" in row):
-                            try:
-                                fii_net = float(row["fii_buy"]) - float(row["fii_sell"])
-                            except Exception:
-                                pass
-                        if dii_net is None and ("dii_buy" in row and "dii_sell" in row):
-                            try:
-                                dii_net = float(row["dii_buy"]) - float(row["dii_sell"])
-                            except Exception:
-                                pass
-
-                        def to_float(x):
-                            try:
-                                # values sometimes come as strings with commas
-                                return float(str(x).replace(",", "").strip())
-                            except Exception:
-                                return None
-
-                        fii_net = to_float(fii_net)
-                        dii_net = to_float(dii_net)
-
-                        rows.append(
-                            {
-                                "date": parsed.isoformat(),
-                                "segment": seg if seg else "Cash",
-                                "fii_net_value_cr": fii_net,
-                                "dii_net_value_cr": dii_net,
-                            }
-                        )
-                    if rows:
-                        payload_df = pd.DataFrame(rows)
-                        break
-            except Exception as e:
-                last_err = e
-                time.sleep(0.8)
+                dtest = t.iloc[:, idx].map(to_date_any)
+                if dtest.notna().sum() >= max(3, int(len(t) * 0.3)):
+                    date_col_idx = idx
+                    break
+            except Exception:
                 continue
+        if date_col_idx is None:
+            continue
+        # check that the row has enough numeric columns overall
+        numeric_count = 0
+        for col in t.columns:
+            # count cells that look numeric
+            s = t[col].astype(str)
+            numeric_count += s.str.contains(r"[-+]?\d[\d,]*\.?\d*").sum()
+        if numeric_count >= len(t) * 3:  # rough heuristic
+            candidate = (t, date_col_idx)
+            break
 
-        if payload_df is None:
-            raise RuntimeError(f"Failed to fetch NSE FII/DII payload. Last error: {last_err}")
+    if candidate is None:
+        raise RuntimeError("Moneycontrol: could not locate a suitable Cash activity table")
 
-        # Keep only Cash segment if multiple segments appear
-        # and drop exact dupes; sort by date
-        payload_df["segment"] = payload_df["segment"].fillna("Cash")
-        return (
-            payload_df[payload_df["segment"].str.contains("cash", case=False, na=False) | (payload_df["segment"] == "Cash")]
-            .drop_duplicates()
-            .sort_values("date")
-            .reset_index(drop=True)
-        )
+    t, dcol = candidate
+    df = pd.DataFrame()
+    df["date"] = t.iloc[:, dcol].map(to_date_any)
+    df = df.dropna(subset=["date"]).copy()
+    df["date"] = df["date"].map(lambda d: d.isoformat())
+    df["segment"] = "Cash"
+
+    # Try to locate nets explicitly by column names
+    # Common patterns include 'FII Net', 'DII Net', 'Net Investment by FII/FPI', etc.
+    cols_lower = {str(c).strip().lower(): c for c in t.columns}
+
+    def find_col(partials):
+        for p in partials:
+            p = p.lower()
+            for k, v in cols_lower.items():
+                if p in k:
+                    return v
+        return None
+
+    col_fii_net = find_col(["fii net", "fii/fpi net", "net investment by fii", "net by fii"])
+    col_dii_net = find_col(["dii net", "dii/mf net", "net investment by dii", "net by dii"])
+
+    # If explicit nets aren’t found, try derive from buy/sell
+    col_fii_buy = find_col(["fii gross purchase", "fii buy", "gross purchase by fii"])
+    col_fii_sell = find_col(["fii gross sales", "fii sell", "gross sales by fii"])
+    col_dii_buy = find_col(["dii gross purchase", "dii buy", "gross purchase by dii"])
+    col_dii_sell = find_col(["dii gross sales", "dii sell", "gross sales by dii"])
+
+    if col_fii_net and col_dii_net:
+        df["fii_net_value_cr"] = t[col_fii_net].map(to_float)
+        df["dii_net_value_cr"] = t[col_dii_net].map(to_float)
+    elif all([col_fii_buy, col_fii_sell, col_dii_buy, col_dii_sell]):
+        df["fii_net_value_cr"] = t[col_fii_buy].map(to_float) - t[col_fii_sell].map(to_float)
+        df["dii_net_value_cr"] = t[col_dii_buy].map(to_float) - t[col_dii_sell].map(to_float)
+    else:
+        # Last resort: pick any numeric-looking 6 columns after the date; assume order buy,sell,net for FII then DII
+        # Build a numeric-only frame (dropping the date column)
+        num_cols = []
+        for c in t.columns:
+            if c == t.columns[dcol]:
+                continue
+            # mark numeric-ish columns
+            ser = t[c].astype(str)
+            ratio = ser.str.contains(r"[-+]?\d[\d,]*\.?\d*").mean()
+            if ratio > 0.5:
+                num_cols.append(c)
+        if len(num_cols) >= 6:
+            tmp = t[num_cols].applymap(to_float)
+            df["fii_net_value_cr"] = tmp.iloc[:, 2]
+            df["dii_net_value_cr"] = tmp.iloc[:, 5]
+        else:
+            raise RuntimeError("Moneycontrol: nets not found/derived")
+
+    df["source"] = "Moneycontrol"
+    df = df.drop_duplicates(subset=["date"]).sort_values("date").reset_index(drop=True)
+    return df[["date", "segment", "fii_net_value_cr", "dii_net_value_cr", "source"]]
 
 def main():
     path = DATA / "fii_dii_agg.parquet"
     try:
         old = pd.read_parquet(path)
     except Exception:
-        old = pd.DataFrame(columns=["date", "segment", "fii_net_value_cr", "dii_net_value_cr"])
+        old = pd.DataFrame(columns=["date", "segment", "fii_net_value_cr", "dii_net_value_cr", "source"])
 
-    new = fetch_fii_dii()
-    # upsert on (date, segment)
+    new = fetch_from_moneycontrol()
     merged = pd.concat([old, new], ignore_index=True)
-    merged = merged.sort_values(["date", "segment"]).drop_duplicates(["date", "segment"], keep="last")
+    merged = (
+        merged.sort_values(["date", "segment"])
+        .drop_duplicates(["date", "segment"], keep="last")
+        .reset_index(drop=True)
+    )
     merged.to_parquet(path, index=False)
-    print(f"Saved {len(merged)} rows → {path}")
+    print(f"Saved {len(merged)} rows → {path} (latest row: {merged.tail(1).to_dict('records')[0]})")
 
 if __name__ == "__main__":
     main()
