@@ -32,6 +32,16 @@ def load_parquet_safe(name: str) -> pd.DataFrame:
     except Exception as e:
         st.error(f"Failed to read {name}: {e}")
         return pd.DataFrame()
+    
+st.subheader("FII/DII Net (₹ cr) — last 60 days")
+if not fii.empty:
+    plot = fii.copy()
+    plot["date"] = pd.to_datetime(plot["date"])
+    plot = plot.sort_values("date").tail(60).set_index("date")[["fii_net_value_cr","dii_net_value_cr"]]
+    st.line_chart(plot)
+else:
+    st.caption("No FII/DII data yet")
+
 
 # --------------- Helper to render dataframes ------------------------
 def show_df(df: pd.DataFrame, placeholder="(no rows)"):
