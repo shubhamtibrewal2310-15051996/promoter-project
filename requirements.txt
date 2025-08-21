@@ -1,9 +1,6 @@
+# requirements.txt
 streamlit
 pandas
-duckdb
-pyarrow
-fastparquet
 requests
 beautifulsoup4
-python-dateutil
-rapidfuzz
+lxml
