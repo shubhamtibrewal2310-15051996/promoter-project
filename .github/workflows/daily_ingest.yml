@@ -1,0 +1,27 @@
+name: Daily Ingest
+on:
+  schedule:
+    - cron: '05 13 * * 1-5'   # 6:35pm IST weekdays
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install -r requirements.txt
+      - run: python pipelines/collect_insider.py
+      - run: python pipelines/collect_bulk_block.py
+      - run: python pipelines/collect_fii_dii.py
+      - run: python pipelines/build_signals.py
+      - name: Commit data
+        run: |
+          git config user.email "bot@users.noreply.github.com"
+          git config user.name "data-bot"
+          git add -A
+          git commit -m "chore(data): daily ingest placeholders" || echo "no changes"
+          git push
